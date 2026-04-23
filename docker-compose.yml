@@ -1,48 +1,62 @@
 version: "3.8"
 
-# This file spins up TWO services:
-#   1. Zookeeper  — Kafka's internal manager
-#   2. Kafka      — The actual message broker we send logs to
-
 services:
   zookeeper:
-    image: confluentinc/cp-zookeeper:7.5.0
+    image: confluentinc/cp-zookeeper:7.5.1
     container_name: zookeeper
     environment:
-      ZOOKEEPER_CLIENT_PORT: 2181 # Port Zookeeper listens on
-      ZOOKEEPER_TICK_TIME: 2000 # Heartbeat interval in milliseconds
-    ports:
-      - "2181:2181"
-    healthcheck:
-      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
 
-  kafka:
-    image: confluentinc/cp-kafka:7.5.0
-    container_name: kafka
-    depends_on:
-      zookeeper:
-        condition: service_healthy # Wait for Zookeeper to be ready first
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: ngrok
+    # Ensure your .env file has NGROK_AUTH_TOKEN or replace ${NGROK_AUTH_TOKEN} below
+    command: tcp broker:9092 --log stdout --authtoken ${NGROK_AUTH_TOKEN}
     ports:
-      - "9092:9092" # This is the port your Python script connects to
+      - "4040:4040"
+
+  broker:
+    image: confluentinc/cp-kafka:7.5.1
+    container_name: broker
+    depends_on:
+      - zookeeper
+      - ngrok
     environment:
       KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181 # Tell Kafka where Zookeeper is
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1 # Fine for local dev (1 broker only)
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true" # Auto-create the "nasa-logs" topic on first use
-      KAFKA_LOG_RETENTION_HOURS: 24 # Keep messages for 24 hours
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "kafka-topics",
-          "--bootstrap-server",
-          "localhost:9092",
-          "--list",
-        ]
-      interval: 15s
-      timeout: 10s
-      retries: 10
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # We define the DOCKER listener here; NGROK will be appended by the entrypoint
+      KAFKA_LISTENERS: DOCKER://0.0.0.0:29092,NGROK://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: DOCKER://broker:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: DOCKER:PLAINTEXT,NGROK:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        echo "Waiting for ngrok tunnel..."
+        # Loop until the ngrok API returns a valid tunnel list
+        while true; do
+          TUNNELS=$(curl -s http://ngrok:4040/api/tunnels)
+          # Check if the public_url exists in the response
+          if echo "$$TUNNELS" | grep -q "public_url"; then
+            break
+          fi
+          echo "ngrok tunnel not ready (HTTP 200 but no tunnel yet)..."
+          sleep 2
+        done
+
+        # Extract the TCP URL and convert tcp://host:port to NGROK://host:port
+        NGROK_URL=$$(echo "$$TUNNELS" | grep -o 'tcp://[^"]*' | head -n 1 | sed 's/tcp:\/\//NGROK:\/\//')
+
+        echo "Found ngrok address: $$NGROK_URL"
+
+        # Append the ngrok address to the existing advertised listeners
+        export KAFKA_ADVERTISED_LISTENERS="$$KAFKA_ADVERTISED_LISTENERS,$$NGROK_URL"
+
+        echo "Final KAFKA_ADVERTISED_LISTENERS: $$KAFKA_ADVERTISED_LISTENERS"
+
+        # Execute the original startup script
+        exec /etc/confluent/docker/run
